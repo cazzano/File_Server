@@ -1,0 +1,3 @@
+KDE-Full : sudo apt install kde-full
+KDE-Standard : sudo apt install kde-standard
+KDE-Plasma-Desktop : sudo apt install kde-plasma-desktop

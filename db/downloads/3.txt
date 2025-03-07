@@ -1,0 +1,29 @@
+There are some steps of making android into kali linux:
+1.export distro=bullseye # For Debian
+2.export distro=focal # For Ubuntu
+3.sudo curl https://repo.waydro.id/waydroid.gpg --output /usr/share/keyrings/waydroid.gpg
+4.echo "deb [signed-by=/usr/share/keyrings/waydroid.gpg] https://repo.waydro.id/ ${distro} main" | \
+  sudo tee /etc/apt/sources.list.d/waydroid.list
+5.sudo apt update
+6.sudo apt install -y \
+  build-essential cdbs devscripts equivs fakeroot \
+  git git-buildpackage git-lfs \
+  libgbinder-dev
+7.sudo wget https://raw.githubusercontent.com/MrCyjaneK/waydroid-build/main/build_changelog \
+                             -O /usr/bin/build_changelog
+8.sudo chmod +x ${_}
+9.mkdir ~/build-packages
+10.cd ${_}
+11.git clone https://github.com/waydroid/gbinder-python.git
+12.cd gbinder-python
+13.build_changelog
+14.sudo mk-build-deps -ir -t "apt -o Debug::pkgProblemResolver=yes -y --no-install-recommends"
+15.sudo debuild -b -uc -us
+16.sudo apt install -f -y ../*.deb
+17.sudo apt remove libgbinder-dev gbinder-python-build-deps git-lfs fakeroot equivs devscripts cdbs
+18.sudo apt autoremove
+19.sudo rm /usr/bin/build_changelog
+20.sudo apt install waydroid -y
+21.sudo apt install weston
+
+
