@@ -1,5 +1,0 @@
-There are some steps to become installable of everything:
-1.cd /etc/sources
-2.sudo nano sources.list
-3.deb http://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware
-
