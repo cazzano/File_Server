@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from werkzeug.utils import secure_filename
 import os
 import magic
@@ -6,6 +6,9 @@ import time
 from functools import wraps
 import logging
 from flask_cors import CORS
+import zipfile
+import io
+import shutil
 
 app = Flask(__name__)
 CORS(app)
@@ -274,6 +277,95 @@ def handle_downloads():
             file=request.files.get('file'),
             book_id=book_id
         )
+
+# Backup endpoint
+
+
+@app.route('/backup', methods=['GET'])
+@rate_limit
+def backup_db():
+    """Create a zip file containing all files in the db directory and its subdirectories"""
+    try:
+        # Create a memory file for the zip
+        memory_file = io.BytesIO()
+
+        # Create the zip file
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Walk through all directories in the db folder
+            for root, dirs, files in os.walk('db'):
+                for file in files:
+                    # Get the full file path
+                    file_path = os.path.join(root, file)
+                    # Add file to zip with its relative path
+                    # The arcname parameter ensures the zip maintains the folder structure
+                    zf.write(file_path, arcname=file_path)
+
+        # Seek to the beginning of the memory file
+        memory_file.seek(0)
+
+        # Return the zip file as an attachment
+        return send_file(
+            memory_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='db_backup.zip'
+        )
+
+    except Exception as e:
+        logger.error(f"Error creating backup: {e}")
+        return jsonify({'error': 'Failed to create backup'}), 500
+
+
+# Restore endpoint
+@app.route('/restore', methods=['POST'])
+@rate_limit
+def restore_db():
+    """Restore db folder from a zip file"""
+    try:
+        # Check if a file was uploaded
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+
+        # Check if it's a zip file
+        if not file.filename.endswith('.zip'):
+            return jsonify({'error': 'File must be a zip archive'}), 400
+
+        # Create a temporary file for the uploaded zip
+        zip_data = file.read()
+        zip_file = io.BytesIO(zip_data)
+
+        # Create a backup of the current db folder first
+        backup_folder = 'db_backup_before_restore'
+        if os.path.exists(backup_folder):
+            shutil.rmtree(backup_folder)
+        shutil.copytree('db', backup_folder)
+
+        # Empty the current db folder without deleting the folder structure
+        for root, dirs, files in os.walk('db'):
+            for f in files:
+                os.remove(os.path.join(root, f))
+
+        # Extract the zip file to the db folder
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            for member in zip_ref.namelist():
+                # Only extract files that start with 'db/'
+                if member.startswith('db/'):
+                    zip_ref.extract(member, '.')
+
+        return jsonify({'message': 'Database restored successfully'}), 200
+
+    except Exception as e:
+        logger.error(f"Error restoring backup: {e}")
+        # Try to restore from backup if something went wrong
+        try:
+            if os.path.exists(backup_folder):
+                shutil.rmtree('db')
+                shutil.copytree(backup_folder, 'db')
+        except:
+            pass
+        return jsonify({'error': f'Failed to restore backup: {str(e)}'}), 500
 
 # Error handlers
 
