@@ -9,6 +9,10 @@ from flask_cors import CORS
 import zipfile
 import io
 import shutil
+import threading
+import tempfile
+import requests
+from werkzeug.serving import is_running_from_reloader
 
 app = Flask(__name__)
 CORS(app)
@@ -27,7 +31,7 @@ os.makedirs(DOWNLOADS_FOLDER, exist_ok=True)
 
 # Configuration
 app.config['MAX_CONTENT_LENGTH'] = 100 * \
-    1024 * 1024 * 1024  # 16MB max file size
+    1024 * 1024 * 1024  # 100GB max file size
 ALLOWED_PICTURE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 ALLOWED_DOWNLOAD_EXTENSIONS = {'pdf', 'doc', 'docx', 'txt', 'zip', 'rar'}
 
@@ -35,6 +39,13 @@ ALLOWED_DOWNLOAD_EXTENSIONS = {'pdf', 'doc', 'docx', 'txt', 'zip', 'rar'}
 RATE_LIMIT = 100  # requests
 RATE_TIME = 3600  # seconds (1 hour)
 request_history = {}
+
+# Backup/Restore configuration
+BACKUP_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks for backup streaming
+RESTORE_TEMP_DIR = 'restore_temp'
+MAX_RETRIES = 3
+TIMEOUT = 180  # 3 minutes timeout for operations
+active_operations = {}  # Track ongoing backup/restore operations
 
 
 def is_valid_file_type(file, folder_type):
@@ -279,68 +290,51 @@ def handle_downloads():
             book_id=book_id
         )
 
-# Backup endpoint
+
+# Backup and Restore Helper Functions
+def generate_operation_id():
+    """Generate a unique operation ID"""
+    return str(int(time.time() * 1000))
 
 
-@app.route('/backup', methods=['GET'])
-@rate_limit
-def backup_db():
-    """Create a zip file containing all files in the db directory and its subdirectories"""
+def create_backup_archive(operation_id):
+    """Create a zip archive of the db directory"""
     try:
-        # Create a memory file for the zip
-        memory_file = io.BytesIO()
+        # Path for the backup file
+        backup_path = os.path.join(
+            tempfile.gettempdir(), f'db_backup_{operation_id}.zip')
 
         # Create the zip file
-        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             # Walk through all directories in the db folder
             for root, dirs, files in os.walk('db'):
                 for file in files:
                     # Get the full file path
                     file_path = os.path.join(root, file)
                     # Add file to zip with its relative path
-                    # The arcname parameter ensures the zip maintains the folder structure
                     zf.write(file_path, arcname=file_path)
 
-        # Seek to the beginning of the memory file
-        memory_file.seek(0)
+        # Update operation status
+        active_operations[operation_id]['status'] = 'completed'
+        active_operations[operation_id]['file_path'] = backup_path
 
-        # Return the zip file as an attachment
-        return send_file(
-            memory_file,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name='db_backup.zip'
-        )
-
+        logger.info(f"Backup {operation_id} completed successfully")
+        return True
     except Exception as e:
-        logger.error(f"Error creating backup: {e}")
-        return jsonify({'error': 'Failed to create backup'}), 500
+        logger.error(f"Error creating backup {operation_id}: {e}")
+        active_operations[operation_id]['status'] = 'failed'
+        active_operations[operation_id]['error'] = str(e)
+        return False
 
 
-# Restore endpoint
-@app.route('/restore', methods=['POST'])
-@rate_limit
-def restore_db():
-    """Restore db folder from a zip file"""
+def process_restore_archive(operation_id, zip_path):
+    """Process a restore operation from a zip file"""
     try:
-        # Check if a file was uploaded
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-
-        file = request.files['file']
-
-        # Check if it's a zip file
-        if not file.filename.endswith('.zip'):
-            return jsonify({'error': 'File must be a zip archive'}), 400
-
-        # Create a temporary file for the uploaded zip
-        zip_data = file.read()
-        zip_file = io.BytesIO(zip_data)
-
         # Create a backup of the current db folder first
-        backup_folder = 'db_backup_before_restore'
+        backup_folder = f'db_backup_before_restore_{operation_id}'
         if os.path.exists(backup_folder):
             shutil.rmtree(backup_folder)
+
         shutil.copytree('db', backup_folder)
 
         # Empty the current db folder without deleting the folder structure
@@ -349,28 +343,314 @@ def restore_db():
                 os.remove(os.path.join(root, f))
 
         # Extract the zip file to the db folder
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             for member in zip_ref.namelist():
                 # Only extract files that start with 'db/'
                 if member.startswith('db/'):
                     zip_ref.extract(member, '.')
 
-        return jsonify({'message': 'Database restored successfully'}), 200
+        # Update operation status
+        active_operations[operation_id]['status'] = 'completed'
 
+        # Clean up temporary files
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+        logger.info(f"Restore {operation_id} completed successfully")
+        return True
     except Exception as e:
-        logger.error(f"Error restoring backup: {e}")
+        logger.error(f"Error restoring backup {operation_id}: {e}")
+        active_operations[operation_id]['status'] = 'failed'
+        active_operations[operation_id]['error'] = str(e)
+
         # Try to restore from backup if something went wrong
         try:
             if os.path.exists(backup_folder):
                 shutil.rmtree('db')
                 shutil.copytree(backup_folder, 'db')
-        except:
-            pass
-        return jsonify({'error': f'Failed to restore backup: {str(e)}'}), 500
+        except Exception as restore_error:
+            logger.error(f"Error restoring from backup: {restore_error}")
+
+        return False
+
+
+# Enhanced Backup Endpoint
+@app.route('/backup', methods=['GET'])
+@rate_limit
+def backup_db():
+    """Create a zip file containing all files in the db directory with support for slow connections"""
+    try:
+        # Check if client wants to stream the backup or start an async operation
+        stream_mode = request.args.get('stream', 'true').lower() == 'true'
+
+        if stream_mode:
+            # Original streaming approach
+            memory_file = io.BytesIO()
+
+            with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk('db'):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        zf.write(file_path, arcname=file_path)
+
+            memory_file.seek(0)
+
+            response = send_file(
+                memory_file,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='db_backup.zip'
+            )
+            # Set timeout and chunked transfer encoding
+            response.headers['Transfer-Encoding'] = 'chunked'
+            return response
+        else:
+            # Async approach for slow connections
+            operation_id = generate_operation_id()
+            active_operations[operation_id] = {
+                'type': 'backup',
+                'status': 'in_progress',
+                'start_time': time.time()
+            }
+
+            # Start backup process in a separate thread
+            thread = threading.Thread(
+                target=create_backup_archive,
+                args=(operation_id,)
+            )
+            thread.daemon = True
+            thread.start()
+
+            return jsonify({
+                'message': 'Backup operation started',
+                'operation_id': operation_id,
+                'status_url': f'/operation/{operation_id}'
+            }), 202
+
+    except Exception as e:
+        logger.error(f"Error initiating backup: {e}")
+        return jsonify({'error': f'Failed to create backup: {str(e)}'}), 500
+
+
+# Enhanced Restore Endpoint
+@app.route('/restore', methods=['POST'])
+@rate_limit
+def restore_db():
+    """Restore db folder from a zip file with support for slow connections"""
+    try:
+        # Check for chunk mode or full upload
+        chunk_mode = request.args.get('chunk', 'false').lower() == 'true'
+        operation_id = request.args.get('operation_id')
+
+        # Full file upload (may fail with slow connections)
+        if not chunk_mode:
+            if 'file' not in request.files:
+                return jsonify({'error': 'No file provided'}), 400
+
+            file = request.files['file']
+            if not file.filename.endswith('.zip'):
+                return jsonify({'error': 'File must be a zip archive'}), 400
+
+            # Create a new operation
+            operation_id = generate_operation_id()
+            active_operations[operation_id] = {
+                'type': 'restore',
+                'status': 'in_progress',
+                'start_time': time.time()
+            }
+
+            # Save the uploaded file to a temporary location
+            temp_path = os.path.join(
+                tempfile.gettempdir(), f'restore_{operation_id}.zip')
+            file.save(temp_path)
+
+            # Process the restore in a separate thread
+            thread = threading.Thread(
+                target=process_restore_archive,
+                args=(operation_id, temp_path)
+            )
+            thread.daemon = True
+            thread.start()
+
+            return jsonify({
+                'message': 'Restore operation started',
+                'operation_id': operation_id,
+                'status_url': f'/operation/{operation_id}'
+            }), 202
+
+        # Chunked upload handling
+        else:
+            # Ensure we have an operation ID
+            if not operation_id:
+                # Start a new chunked upload
+                operation_id = generate_operation_id()
+                chunk_dir = os.path.join(
+                    tempfile.gettempdir(), f'restore_chunks_{operation_id}')
+                os.makedirs(chunk_dir, exist_ok=True)
+
+                active_operations[operation_id] = {
+                    'type': 'restore_chunked',
+                    'status': 'receiving_chunks',
+                    'start_time': time.time(),
+                    'chunk_dir': chunk_dir,
+                    'chunks_received': 0,
+                    'total_chunks': int(request.headers.get('X-Total-Chunks', '0'))
+                }
+
+                return jsonify({
+                    'message': 'Chunked restore initialized',
+                    'operation_id': operation_id,
+                    'status_url': f'/operation/{operation_id}'
+                }), 202
+
+            # Process an existing chunked upload
+            if operation_id not in active_operations:
+                return jsonify({'error': 'Invalid operation ID'}), 400
+
+            # Get operation info
+            op_info = active_operations[operation_id]
+
+            # Handle chunk upload
+            if 'file' not in request.files:
+                return jsonify({'error': 'No chunk provided'}), 400
+
+            chunk = request.files['file']
+            chunk_number = int(request.args.get('chunk_number', '0'))
+            chunk_path = os.path.join(
+                op_info['chunk_dir'], f'chunk_{chunk_number}')
+
+            # Save the chunk
+            chunk.save(chunk_path)
+            op_info['chunks_received'] += 1
+
+            # Check if all chunks received
+            if op_info['chunks_received'] >= op_info['total_chunks']:
+                # Combine chunks
+                combined_path = os.path.join(
+                    tempfile.gettempdir(), f'restore_{operation_id}.zip')
+                with open(combined_path, 'wb') as outfile:
+                    for i in range(op_info['total_chunks']):
+                        chunk_path = os.path.join(
+                            op_info['chunk_dir'], f'chunk_{i}')
+                        with open(chunk_path, 'rb') as infile:
+                            outfile.write(infile.read())
+
+                # Update status
+                op_info['status'] = 'processing'
+
+                # Process the combined file
+                thread = threading.Thread(
+                    target=process_restore_archive,
+                    args=(operation_id, combined_path)
+                )
+                thread.daemon = True
+                thread.start()
+
+                # Clean up chunk directory
+                shutil.rmtree(op_info['chunk_dir'], ignore_errors=True)
+
+                return jsonify({
+                    'message': 'All chunks received, processing restore',
+                    'operation_id': operation_id,
+                    'status_url': f'/operation/{operation_id}'
+                }), 200
+
+            # Not all chunks received yet
+            return jsonify({
+                'message': f'Chunk {chunk_number} received',
+                'operation_id': operation_id,
+                'chunks_received': op_info['chunks_received'],
+                'total_chunks': op_info['total_chunks']
+            }), 200
+
+    except Exception as e:
+        logger.error(f"Error in restore operation: {e}")
+        return jsonify({'error': f'Failed to restore: {str(e)}'}), 500
+
+
+# Operation Status Endpoint
+@app.route('/operation/<operation_id>', methods=['GET'])
+@rate_limit
+def operation_status(operation_id):
+    """Check the status of a backup or restore operation"""
+    if operation_id not in active_operations:
+        return jsonify({'error': 'Operation not found'}), 404
+
+    op_info = active_operations[operation_id]
+
+    # If operation is completed and it's a backup, return the file
+    if op_info['type'] == 'backup' and op_info['status'] == 'completed' and request.args.get('download', 'false').lower() == 'true':
+        if os.path.exists(op_info['file_path']):
+            return send_file(
+                op_info['file_path'],
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='db_backup.zip'
+            )
+
+    # Return the operation status
+    result = {
+        'operation_id': operation_id,
+        'type': op_info['type'],
+        'status': op_info['status'],
+        'start_time': op_info['start_time'],
+        'elapsed_time': time.time() - op_info['start_time']
+    }
+
+    # Add operation-specific information
+    if op_info['type'] == 'restore_chunked' and op_info['status'] == 'receiving_chunks':
+        result.update({
+            'chunks_received': op_info['chunks_received'],
+            'total_chunks': op_info['total_chunks'],
+            'progress': (op_info['chunks_received'] / op_info['total_chunks']) * 100 if op_info['total_chunks'] > 0 else 0
+        })
+
+    # Add error information if available
+    if 'error' in op_info:
+        result['error'] = op_info['error']
+
+    # Clean up completed operations after some time
+    if op_info['status'] in ['completed', 'failed'] and (time.time() - op_info['start_time']) > 3600:
+        # Remove temporary files
+        if op_info['type'] == 'backup' and 'file_path' in op_info and os.path.exists(op_info['file_path']):
+            os.remove(op_info['file_path'])
+
+        # Schedule for removal from active_operations
+        # We don't remove it immediately to allow the client to check the status
+        def cleanup_operation():
+            if operation_id in active_operations:
+                del active_operations[operation_id]
+
+        # Remove after 5 minutes
+        threading.Timer(300, cleanup_operation).start()
+
+    return jsonify(result)
+
+
+# Cleanup function that used to be @app.before_first_request
+def cleanup_temp_files():
+    """Clean up any temporary files from previous runs"""
+    if not is_running_from_reloader():
+        temp_dir = tempfile.gettempdir()
+        for filename in os.listdir(temp_dir):
+            if filename.startswith(('db_backup_', 'restore_')):
+                try:
+                    file_path = os.path.join(temp_dir, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path, ignore_errors=True)
+                except Exception as e:
+                    logger.error(
+                        f"Error cleaning up temp file {filename}: {e}")
+
+
+# Execute the cleanup function at startup
+with app.app_context():
+    cleanup_temp_files()
+
 
 # Error handlers
-
-
 @app.errorhandler(404)
 def not_found_error(error):
     return jsonify({'error': 'Not found'}), 404

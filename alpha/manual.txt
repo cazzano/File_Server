@@ -32,3 +32,34 @@ curl -O http://localhost:5000/db/pictures/123.jpg
 # Get a document
 curl -O http://localhost:5000/db/downloads/123.pdf
 
+
+For Backup:
+
+Standard Streaming Backup (Default):
+CopyGET /backup
+
+Asynchronous Backup (Better for Slow Connections):
+CopyGET /backup?stream=false
+
+Returns an operation ID
+Check status with GET /operation/{operation_id}
+Download when ready with GET /operation/{operation_id}?download=true
+
+
+
+For Restore:
+
+Standard Upload (Small Files):
+CopyPOST /restore
+Content-Type: multipart/form-data
+[file: backup.zip]
+
+Chunked Upload (Large Files/Slow Connections):
+Copy# Initialize chunked upload
+POST /restore?chunk=true
+Headers: X-Total-Chunks: 10
+
+# Upload each chunk
+POST /restore?chunk=true&operation_id={id}&chunk_number=0
+Content-Type: multipart/form-data
+[file: chunk_data]
